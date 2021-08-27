@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
@@ -34,6 +35,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/go-yaml/yaml"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type labels struct {
@@ -60,11 +64,52 @@ var times = flag.Int("config.scrape-times", 0, "how many times to scrape before 
 var roleArn = flag.String("config.role-arn", "", "ARN of the role to assume when scraping the AWS API (optional)")
 var prometheusPortLabel = flag.String("config.port-label", "PROMETHEUS_EXPORTER_PORT", "Docker label to define the scrape port of the application (if missing an application won't be scraped)")
 var prometheusPathLabel = flag.String("config.path-label", "PROMETHEUS_EXPORTER_PATH", "Docker label to define the scrape path of the application")
-var prometheusSchemeLabel= flag.String("config.scheme-label", "PROMETHEUS_EXPORTER_SCHEME", "Docker label to define the scheme of the target application")
+var prometheusSchemeLabel = flag.String("config.scheme-label", "PROMETHEUS_EXPORTER_SCHEME", "Docker label to define the scheme of the target application")
 var prometheusFilterLabel = flag.String("config.filter-label", "", "Docker label (and optionally value) to require to scrape the application")
 var prometheusServerNameLabel = flag.String("config.server-name-label", "PROMETHEUS_EXPORTER_SERVER_NAME", "Docker label to define the server name")
 var prometheusJobNameLabel = flag.String("config.job-name-label", "PROMETHEUS_EXPORTER_JOB_NAME", "Docker label to define the job name")
 var prometheusDynamicPortDetection = flag.Bool("config.dynamic-port-detection", false, fmt.Sprintf("If true, only tasks with the Docker label %s=1 will be scraped", dynamicPortLabel))
+
+var (
+	sdFileLastUpdateTime = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "sd_file_last_update_time",
+			Help: "SD file last update time",
+		},
+		[]string{"cluster"},
+	)
+
+	sdFileTotalWritesCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sd_file_total_writes_count",
+			Help: "Total number of writes to SD file",
+		},
+		[]string{"cluster"},
+	)
+
+	sdFileFailedWritesCounter = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sd_file_failed_writes_count",
+			Help: "Total number of failed writes to SD file",
+		},
+		[]string{"cluster"},
+	)
+
+	ecsDiscoveredTargetCount = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ecs_discovered_target_count",
+			Help: "Total number targets discovered",
+		},
+		[]string{"cluster"},
+	)
+)
+
+func Serve() {
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		http.ListenAndServe(":2112", nil)
+	}()
+}
 
 // logError is a convenience function that decodes all possible ECS
 // errors and displays them to standard error.
@@ -297,7 +342,7 @@ func (t *AugmentedTask) ExporterInformation() []*PrometheusTaskInfo {
 
 		scheme, ok = d.DockerLabels[*prometheusSchemeLabel]
 		if ok {
-		    labels.Scheme = scheme
+			labels.Scheme = scheme
 		}
 
 		ret = append(ret, &PrometheusTaskInfo{
@@ -604,6 +649,7 @@ func GetAugmentedTasks(svc *ecs.Client, svcec2 *ec2.Client, clusterArns []*strin
 func main() {
 	flag.Parse()
 
+	Serve()
 	config, err := config.LoadDefaultConfig(context.Background())
 	if err != nil {
 		logError(err)
@@ -628,6 +674,7 @@ func main() {
 				Clusters: []string{*cluster},
 			})
 			if err != nil {
+				ecsDiscoveredTargetCount.WithLabelValues(*cluster).Set(0)
 				logError(err)
 				return
 			}
@@ -652,6 +699,7 @@ func main() {
 
 		tasks, err := GetAugmentedTasks(svc, svcec2, StringToStarString(clusters.ClusterArns))
 		if err != nil {
+			ecsDiscoveredTargetCount.WithLabelValues(*cluster).Set(0)
 			logError(err)
 			return
 		}
@@ -666,11 +714,15 @@ func main() {
 			return
 		}
 		log.Printf("Writing %d discovered exporters to %s", len(infos), *outFile)
+		ecsDiscoveredTargetCount.WithLabelValues(*cluster).Set(float64(len(infos)))
 		err = ioutil.WriteFile(*outFile, m, 0644)
+		sdFileTotalWritesCounter.WithLabelValues(*cluster).Inc()
 		if err != nil {
+			sdFileFailedWritesCounter.WithLabelValues(*cluster).Inc()
 			logError(err)
 			return
 		}
+		sdFileLastUpdateTime.WithLabelValues(*cluster).SetToCurrentTime()
 	}
 	s := time.NewTimer(1 * time.Millisecond)
 	t := time.NewTicker(*interval)
