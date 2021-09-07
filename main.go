@@ -58,6 +58,7 @@ type labels struct {
 const dynamicPortLabel = "PROMETHEUS_DYNAMIC_EXPORT"
 
 var cluster = flag.String("config.cluster", "", "name of the cluster to scrape")
+var account = flag.String("config.account", "", "name of the account in which clusters are present")
 var outFile = flag.String("config.write-to", "ecs_file_sd.yml", "path of file to write ECS service discovery information to")
 var interval = flag.Duration("config.scrape-interval", 60*time.Second, "interval at which to scrape the AWS API for ECS service discovery information")
 var times = flag.Int("config.scrape-times", 0, "how many times to scrape before exiting (0 = infinite)")
@@ -76,7 +77,7 @@ var (
 			Name: "sd_file_last_update_time",
 			Help: "SD file last update time",
 		},
-		[]string{"cluster"},
+		[]string{"account"},
 	)
 
 	sdFileTotalWritesCounter = promauto.NewCounterVec(
@@ -84,7 +85,7 @@ var (
 			Name: "sd_file_total_writes_count",
 			Help: "Total number of writes to SD file",
 		},
-		[]string{"cluster"},
+		[]string{"account"},
 	)
 
 	sdFileFailedWritesCounter = promauto.NewCounterVec(
@@ -92,15 +93,23 @@ var (
 			Name: "sd_file_failed_writes_count",
 			Help: "Total number of failed writes to SD file",
 		},
-		[]string{"cluster"},
+		[]string{"account"},
 	)
 
 	ecsDiscoveredTargetCount = promauto.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "ecs_discovered_target_count",
+			Help: "Total number targets discovered per cluster",
+		},
+		[]string{"cluster", "account"},
+	)
+
+	ecsDiscoveryStatus = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "ecs_sd_status",
 			Help: "Total number targets discovered",
 		},
-		[]string{"cluster"},
+		[]string{"account"},
 	)
 )
 
@@ -674,12 +683,13 @@ func main() {
 				Clusters: []string{*cluster},
 			})
 			if err != nil {
-				ecsDiscoveredTargetCount.WithLabelValues(*cluster).Set(0)
+				ecsDiscoveryStatus.WithLabelValues(*account).Set(0)
 				logError(err)
 				return
 			}
 
 			if len(res.Clusters) == 0 {
+				ecsDiscoveryStatus.WithLabelValues(*account).Set(0)
 				logError(fmt.Errorf("%s cluster not found", *cluster))
 				return
 			}
@@ -690,6 +700,7 @@ func main() {
 		} else {
 			c, err := GetClusters(svc)
 			if err != nil {
+				ecsDiscoveryStatus.WithLabelValues(*account).Set(0)
 				logError(err)
 				return
 			}
@@ -699,14 +710,22 @@ func main() {
 
 		tasks, err := GetAugmentedTasks(svc, svcec2, StringToStarString(clusters.ClusterArns))
 		if err != nil {
-			ecsDiscoveredTargetCount.WithLabelValues(*cluster).Set(0)
+			ecsDiscoveryStatus.WithLabelValues(*account).Set(0)
 			logError(err)
 			return
 		}
 		infos := []*PrometheusTaskInfo{}
+		clusterTargetCount := make(map[*string]int)
 		for _, t := range tasks {
 			info := t.ExporterInformation()
 			infos = append(infos, info...)
+			for _, container := range info {
+				if _, ok := clusterTargetCount[t.Task.ClusterArn]; !ok {
+					clusterTargetCount[t.Task.ClusterArn] = len(container.Targets)
+				} else if ok {
+					clusterTargetCount[t.Task.ClusterArn] += len(container.Targets)
+				}
+			}
 		}
 		m, err := yaml.Marshal(infos)
 		if err != nil {
@@ -714,15 +733,20 @@ func main() {
 			return
 		}
 		log.Printf("Writing %d discovered exporters to %s", len(infos), *outFile)
-		ecsDiscoveredTargetCount.WithLabelValues(*cluster).Set(float64(len(infos)))
+		for k, v := range clusterTargetCount {
+			cluster_name := strings.Split(*k, "/")[1]
+			ecsDiscoveredTargetCount.WithLabelValues(cluster_name, *account).Set(float64(v))
+		}
 		err = ioutil.WriteFile(*outFile, m, 0644)
-		sdFileTotalWritesCounter.WithLabelValues(*cluster).Inc()
+		sdFileTotalWritesCounter.WithLabelValues(*account).Inc()
 		if err != nil {
-			sdFileFailedWritesCounter.WithLabelValues(*cluster).Inc()
+			sdFileFailedWritesCounter.WithLabelValues(*account).Inc()
+			ecsDiscoveryStatus.WithLabelValues(*account).Set(0)
 			logError(err)
 			return
 		}
-		sdFileLastUpdateTime.WithLabelValues(*cluster).SetToCurrentTime()
+		sdFileLastUpdateTime.WithLabelValues(*account).SetToCurrentTime()
+		ecsDiscoveryStatus.WithLabelValues(*account).Set(1)
 	}
 	s := time.NewTimer(1 * time.Millisecond)
 	t := time.NewTicker(*interval)
